@@ -3,6 +3,7 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -26,10 +27,22 @@ type Counter struct {
 	CurrentFailure int
 }
 
+func (c *Counter) reset() {
+	c.Total = 0
+	c.TotalSuccess = 0
+	c.TotalFailure = 0
+	c.CurrentSuccess = 0
+	c.CurrentFailure = 0
+}
+
 type CircuitBreaker struct {
+	mu sync.RWMutex
+
+	state State
+
+	counter *Counter
+
 	threshold    int
-	state        State
-	counter      Counter
 	tripTime     time.Time
 	callTimeout  time.Duration
 	resetTimeout time.Duration
@@ -37,6 +50,7 @@ type CircuitBreaker struct {
 
 func New(threshold int, callTimeout, resetTimeout time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
+		counter:      &Counter{},
 		threshold:    threshold,
 		state:        StateClosed,
 		callTimeout:  callTimeout,
@@ -44,28 +58,38 @@ func New(threshold int, callTimeout, resetTimeout time.Duration) *CircuitBreaker
 	}
 }
 
-func (cb *CircuitBreaker) State() State { return cb.state }
+func (cb *CircuitBreaker) State() State {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
 
-func (cb *CircuitBreaker) Count() Counter { return cb.counter }
-
-func (cb *CircuitBreaker) reset() {
-	cb.counter.Total = 0
-	cb.counter.TotalSuccess = 0
-	cb.counter.TotalFailure = 0
-	cb.counter.CurrentSuccess = 0
-	cb.counter.CurrentFailure = 0
+func (cb *CircuitBreaker) Count() Counter {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return Counter{
+		Total:          cb.counter.Total,
+		TotalSuccess:   cb.counter.TotalSuccess,
+		TotalFailure:   cb.counter.TotalFailure,
+		CurrentSuccess: cb.counter.CurrentSuccess,
+		CurrentFailure: cb.counter.CurrentFailure,
+	}
 }
 
 func (cb *CircuitBreaker) Do(f func(ctx context.Context) error) error {
-	switch cb.State() {
+	cb.mu.Lock()
+
+	switch cb.state {
 	case StateOpen:
-		if time.Since(cb.tripTime) > cb.resetTimeout {
-			cb.state = StateHalfOpen
-			return cb.do(f)
+		if time.Since(cb.tripTime) <= cb.resetTimeout {
+			cb.mu.Unlock()
+			return ErrCircuitBreakerOpen
 		}
-		return ErrCircuitBreakerOpen
+		cb.state = StateHalfOpen
 	case StateClosed, StateHalfOpen:
 	}
+
+	cb.mu.Unlock()
 	return cb.do(f)
 }
 
@@ -73,9 +97,13 @@ func (cb *CircuitBreaker) do(f func(ctx context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cb.callTimeout)
 	defer cancel()
 
+	cb.mu.Lock()
 	cb.counter.Total++
+	cb.mu.Unlock()
 
 	err := f(ctx)
+
+	cb.mu.Lock()
 	if err != nil {
 		cb.counter.TotalFailure++
 		cb.counter.CurrentFailure++
@@ -84,12 +112,14 @@ func (cb *CircuitBreaker) do(f func(ctx context.Context) error) error {
 		if cb.counter.CurrentFailure >= cb.threshold {
 			cb.state = StateOpen
 		}
+		cb.mu.Unlock()
 		return err
 	}
 
-	if cb.State() == StateHalfOpen {
-		cb.reset()
+	if cb.state == StateHalfOpen {
 		cb.state = StateClosed
+		cb.counter.reset()
+		cb.mu.Unlock()
 		return nil
 	}
 
@@ -97,5 +127,6 @@ func (cb *CircuitBreaker) do(f func(ctx context.Context) error) error {
 	cb.counter.CurrentSuccess++
 	cb.counter.CurrentFailure = 0
 
+	cb.mu.Unlock()
 	return nil
 }
