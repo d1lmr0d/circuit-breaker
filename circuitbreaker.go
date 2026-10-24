@@ -19,6 +19,8 @@ var (
 	ErrCircuitBreakerOpen = errors.New("circuit breaker open")
 )
 
+type DoFunc func(context.Context) error
+
 type Counter struct {
 	Total          int
 	TotalSuccess   int
@@ -76,7 +78,7 @@ func (cb *CircuitBreaker) Count() Counter {
 	}
 }
 
-func (cb *CircuitBreaker) Do(f func(ctx context.Context) error) error {
+func (cb *CircuitBreaker) Do(ctx context.Context, f DoFunc) error {
 	cb.mu.Lock()
 
 	switch cb.state {
@@ -90,11 +92,11 @@ func (cb *CircuitBreaker) Do(f func(ctx context.Context) error) error {
 	}
 
 	cb.mu.Unlock()
-	return cb.do(f)
+	return cb.do(ctx, f)
 }
 
-func (cb *CircuitBreaker) do(f func(ctx context.Context) error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cb.callTimeout)
+func (cb *CircuitBreaker) do(ctx context.Context, f DoFunc) error {
+	ctx, cancel := context.WithTimeout(ctx, cb.callTimeout)
 	defer cancel()
 
 	cb.mu.Lock()
@@ -105,6 +107,10 @@ func (cb *CircuitBreaker) do(f func(ctx context.Context) error) error {
 
 	cb.mu.Lock()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			cb.mu.Unlock()
+			return err
+		}
 		cb.counter.TotalFailure++
 		cb.counter.CurrentFailure++
 		cb.counter.CurrentSuccess = 0
